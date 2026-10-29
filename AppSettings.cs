@@ -98,10 +98,13 @@ namespace TaskbarInfo
         public bool DesktopWidgetLocked { get; set; } = false;
         
         public double NextLyricFontSizeDiff { get; set; } = 2.0;
+        public double DoubleLineGap { get; set; } = 0.0;
         public string NextLyricFontWeight { get; set; } = "Normal"; // Normal, Light, Bold etc. 
 
         public bool RunOnlyWithMusicApp { get; set; } = false;
         public string MusicAppProcessNames { get; set; } = "QQMusic,cloudmusic,Spotify,YesPlayMusic,Foobar2000"; 
+        public bool CenterTaskbarIcons { get; set; } = false;
+        public bool ApplyTaskbarAcrylic { get; set; } = false;
         public bool AutoCheckUpdates { get; set; } = true;
         public bool LaunchOnStartup { get; set; } = false;
 

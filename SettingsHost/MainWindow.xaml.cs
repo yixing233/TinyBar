@@ -426,7 +426,8 @@ public sealed partial class MainWindow : Window
             LabeledComboBox("字体粗细", FontWeightOptions, ToChineseFontWeight(_settings.FontWeight), value => _settings.FontWeight = ToFontWeight(value)),
             LabeledNumberBox("下一句字号差", _settings.NextLyricFontSizeDiff, 0, 12, value => _settings.NextLyricFontSizeDiff = value),
             LabeledComboBox("下一句字体粗细", FontWeightOptions, ToChineseFontWeight(_settings.NextLyricFontWeight), value => _settings.NextLyricFontWeight = ToFontWeight(value)),
-            LabeledToggle("显示双行歌词", _settings.IsDoubleLine, value => _settings.IsDoubleLine = value)));
+            LabeledToggle("显示双行歌词", _settings.IsDoubleLine, value => _settings.IsDoubleLine = value),
+            LabeledNumberBox("双行歌词间距", _settings.DoubleLineGap, 0, 11, value => _settings.DoubleLineGap = value, step: 1)));
 
         panel.AddRow(SectionHeader("任务栏位置与对齐"));
         panel.AddRow(CreateSettingsCard(
@@ -852,14 +853,34 @@ public sealed partial class MainWindow : Window
         return Wrap(panel);
     }
 
+    private QuickTranslateWindowMaterial? _appliedWindowMaterial;
+
     private void ApplyWindowMaterial()
     {
-        SystemBackdrop = QuickTranslateWindowMaterialParser.Parse(_settings.SettingsWindowMaterial) switch
+        QuickTranslateWindowMaterial material = QuickTranslateWindowMaterialParser.Parse(
+            _settings.SettingsWindowMaterial);
+
+        // MicaBackdrop relies on the Windows 11 DWM backdrop pipeline; on Windows 10 it
+        // produces no background at all, so the window shows the desktop through it.
+        if (material == QuickTranslateWindowMaterial.Mica &&
+            !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+        {
+            material = QuickTranslateWindowMaterial.Acrylic;
+        }
+
+        // Reassigning SystemBackdrop tears down and recreates the compositor surface, so
+        // doing it on every save makes the window background flicker. Only rebuild the
+        // backdrop when the effective material actually changes.
+        if (_appliedWindowMaterial == material) return;
+
+        SystemBackdrop = material switch
         {
             QuickTranslateWindowMaterial.Acrylic => new DesktopAcrylicBackdrop(),
             QuickTranslateWindowMaterial.Solid => null,
             _ => new MicaBackdrop()
         };
+
+        _appliedWindowMaterial = material;
     }
 
     private Page CreateWaterReminderPage()
@@ -2163,6 +2184,11 @@ public sealed partial class MainWindow : Window
             LabeledToggle("仅在指定播放器运行时显示", _settings.RunOnlyWithMusicApp, value => _settings.RunOnlyWithMusicApp = value),
             LabeledTextBox("播放器进程名", _settings.MusicAppProcessNames, value => _settings.MusicAppProcessNames = value, "仅在开启上方选项时生效；使用英文逗号分隔。")));
 
+        panel.AddRow(SectionHeader("任务栏外观"));
+        panel.AddRow(CreateSettingsCard(
+            LabeledToggle("任务栏图标居中", _settings.CenterTaskbarIcons, value => _settings.CenterTaskbarIcons = value),
+            LabeledToggle("白色亚克力背景", _settings.ApplyTaskbarAcrylic, value => _settings.ApplyTaskbarAcrylic = value)));
+
         panel.AddRow(SectionHeader("媒体来源"));
         panel.AddRow(CreateSettingsCard(
             detector,
@@ -3226,7 +3252,17 @@ public sealed partial class MainWindow : Window
 
     private FrameworkElement LabeledNumberBox(string label, double initial, double minimum, double maximum, Action<double> update, double step = 1)
     {
-        var box = new NumberBox { Value = initial, Minimum = minimum, Maximum = maximum, SmallChange = step, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact, MinWidth = 180 };
+        // Inline keeps the spin buttons always visible. Compact mode shows them in a flyout
+        // that does not reliably dismiss when clicking elsewhere, leaving it stuck open.
+        var box = new NumberBox
+        {
+            Value = initial,
+            Minimum = minimum,
+            Maximum = maximum,
+            SmallChange = step,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            MinWidth = 180
+        };
         box.ValueChanged += (_, _) => { if (!double.IsNaN(box.Value)) Commit(box.Value); };
         return Field(label, box, null);
 
@@ -4022,9 +4058,12 @@ public sealed class SettingsDocument
     public double? DesktopWidgetMonitorOffsetY { get; set; }
     public bool DesktopWidgetLocked { get; set; }
     public double NextLyricFontSizeDiff { get; set; } = 2;
+    public double DoubleLineGap { get; set; } = 6;
     public string NextLyricFontWeight { get; set; } = "Normal";
     public bool RunOnlyWithMusicApp { get; set; }
     public string MusicAppProcessNames { get; set; } = "QQMusic,cloudmusic,Spotify,YesPlayMusic,Foobar2000";
+    public bool CenterTaskbarIcons { get; set; }
+    public bool ApplyTaskbarAcrylic { get; set; }
     public bool AutoCheckUpdates { get; set; } = true;
     public bool LaunchOnStartup { get; set; } = false;
 

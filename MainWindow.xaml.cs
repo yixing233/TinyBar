@@ -40,6 +40,7 @@ namespace TaskbarInfo
                 CompositionTarget.Rendering -= OnRenderFrame;
                 StopSharedSettingsApplyNotification();
                 StopSettingsUpdateRequestNotification();
+                RestoreTaskbarOnExit();
                 _taskbarPerformanceWindow?.Dispose();
                 _taskbarTranslateButtonWindow?.Dispose();
                 _taskbarWaterReminderWindow?.Dispose();
@@ -111,6 +112,7 @@ namespace TaskbarInfo
         private readonly UpdateService _updateService = new UpdateService();
         private readonly AudioDeviceService _audioDeviceService = new AudioDeviceService();
         private bool _isUpdatingVolumeSliderProgrammatically;
+        private bool _volumeUiReady;
         private DispatcherTimer? _hoverWatchTimer;
         private UpdateCheckResult? _pendingUpdateResult;
         private bool _isCheckingUpdates;
@@ -122,6 +124,13 @@ namespace TaskbarInfo
         private WaterReminderPopupWindow? _waterReminderPopup;
         private DispatcherTimer? _waterReminderTimer;
         private bool _waterReminderWasDue;
+        private DispatcherTimer? _taskbarCenteringTimer;
+        private IntPtr _centeredTaskSwitcher = IntPtr.Zero;
+        private IntPtr _lastAcrylicTaskbar = IntPtr.Zero;
+        private bool _centeringApplied;
+        private bool _acrylicApplied;
+        private bool _recentringAfterRebuild;
+        private (int Left, int Top, int Width, int Height)? _lastCenteredBounds;
         private QuickTranslatePopupWindow? _quickTranslatePopup;
         private System.Diagnostics.Process? _settingsProcess;
         private HwndSource? _mainWindowSource;
@@ -206,34 +215,47 @@ namespace TaskbarInfo
             }
         }
 
+        /// <summary>
+        /// Loads the tray glyph. The artwork is black with a white outline so a single
+        /// asset stays legible on both light and dark taskbars, and no theme switch is
+        /// needed when the user changes the system theme.
+        /// </summary>
+        private void ApplyTrayIcon()
+        {
+            if (_notifyIcon == null) return;
+
+            try
+            {
+                var uri = new Uri("pack://application:,,,/src/icons/TinyBar_Tray.png");
+                var info = Application.GetResourceStream(uri);
+                if (info != null)
+                {
+                    using (var stream = info.Stream)
+                    using (var bitmap = new System.Drawing.Bitmap(stream))
+                    using (var icon = System.Drawing.Icon.FromHandle(bitmap.GetHicon()))
+                    {
+                        // Clone so the HICON can be destroyed with the temporary bitmap.
+                        _notifyIcon.Icon = (System.Drawing.Icon)icon.Clone();
+                    }
+
+                    return;
+                }
+            }
+            catch
+            {
+                // Fall through to the generic system icon.
+            }
+
+            _notifyIcon.Icon = System.Drawing.SystemIcons.Application;
+        }
+
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
             // Init Tray Icon
             _notifyIcon = new System.Windows.Forms.NotifyIcon();
             try
             {
-                // Tray Icon
-                try
-                {
-                    var trayUri = new Uri("pack://application:,,,/src/icons/TinyBar_Tray.png");
-                    var info = Application.GetResourceStream(trayUri) ?? Application.GetResourceStream(new Uri("pack://application:,,,/src/icons/托盘图标.png"));
-                    if (info != null)
-                    {
-                        using (var stream = info.Stream)
-                        using (var bitmap = new System.Drawing.Bitmap(stream))
-                        {
-                            _notifyIcon.Icon = System.Drawing.Icon.FromHandle(bitmap.GetHicon());
-                        }
-                    }
-                    else
-                    {
-                        _notifyIcon.Icon = System.Drawing.SystemIcons.Application;
-                    }
-                }
-                catch
-                {
-                    _notifyIcon.Icon = System.Drawing.SystemIcons.Application;
-                }
+                ApplyTrayIcon();
 
                 // Window Icon
                 this.Icon = App.GetAppIcon();
@@ -502,6 +524,7 @@ namespace TaskbarInfo
         private void ApplySettings()
         {
             ApplyApplicationTheme();
+            ApplyTrayIcon();
             AutoStartupService.Sync(_settings.LaunchOnStartup);
 
             // Sync Process Monitoring
@@ -509,6 +532,7 @@ namespace TaskbarInfo
             ManageTaskbarPerformance();
             ManageTaskbarTranslateButton();
             ManageWaterReminder();
+            ApplyTaskbarCustomization();
             ConfigureQuickTranslateHotkey();
             
             // Sync Floating Window
@@ -718,11 +742,75 @@ namespace TaskbarInfo
 
                 _mainLyricControl.TextWrapping = TextWrapping.NoWrap;
                 _mainLyricControl.Height = double.NaN;
-                // Set positions for double line mode
-                Canvas.SetTop(_mainLyricControl, 2);
-                Canvas.SetTop(_nextLyricControl, _settings.FontSize + 4);
+
+                UpdateDoubleLineVerticalCentering();
             }
             catch { }
+        }
+
+        /// <summary>Default gap between the two lyric rows, in DIPs.</summary>
+        private const double DefaultDoubleLineGap = 3;
+
+        /// <summary>
+        /// Centres the two lyric rows as a block inside the taskbar strip.
+        /// The rows are laid out top-to-bottom with a configurable gap, then the whole
+        /// block is offset so its middle matches the container's middle.
+        /// </summary>
+        private void UpdateDoubleLineVerticalCentering()
+        {
+            // The container may not have been laid out yet when settings are applied
+            // (e.g. right after the window is re-hosted), which would make ActualHeight
+            // stale and the gap look like it was ignored. Force a layout pass first.
+            if (TextContainer.ActualHeight <= 0 || double.IsNaN(TextContainer.ActualHeight))
+            {
+                TextContainer.UpdateLayout();
+            }
+
+            GetDoubleLinePositions(out double top, out double bottom);
+            Canvas.SetTop(_mainLyricControl, top);
+            Canvas.SetTop(_nextLyricControl, bottom);
+        }
+
+        /// <summary>
+        /// Shared geometry for the double-line layout. Both the static layout and the
+        /// lyric-change animation must use this, otherwise the rows drift apart on every
+        /// scroll animation.
+        /// </summary>
+        private void GetDoubleLinePositions(out double mainTop, out double nextTop)
+        {
+            // Force a layout pass first: ActualHeight is 0 before the window is measured,
+            // which would make the rows jump between renders.
+            if (TextContainer.ActualHeight <= 0)
+            {
+                TextContainer.UpdateLayout();
+            }
+
+            double containerH = TextContainer.ActualHeight;
+            if (containerH <= 0 || double.IsNaN(containerH)) containerH = 40;
+
+            double mainSize = _settings.FontSize;
+            double nextSize = Math.Max(9, _settings.FontSize - _settings.NextLyricFontSizeDiff);
+
+            // Advance height of a single line. 1.35em overestimates and makes two rows
+            // overlap when the gap is 0, so use the tighter 1.2em that matches the actual
+            // rendered line box for the default font stack.
+            double mainH = mainSize * 1.2;
+            double nextH = nextSize * 1.2;
+            // Take the configured gap literally, including 0 (rows flush together). Only a
+            // missing/negative value falls back to the default, which happens for configs
+            // written before the setting existed.
+            double gap = _settings.DoubleLineGap >= 0 ? _settings.DoubleLineGap : DefaultDoubleLineGap;
+
+            // The container is inside a padded border, so its usable height is smaller than
+            // the taskbar strip. Clamp so the second row can never be pushed out of view.
+            double maxGap = Math.Max(0, containerH - mainH - nextH);
+            if (gap > maxGap) gap = maxGap;
+
+            double blockH = mainH + gap + nextH;
+            double startTop = (containerH - blockH) / 2;
+
+            mainTop = startTop;
+            nextTop = startTop + mainH + gap;
         }
 
         private static FontWeight GetConfiguredFontWeight(string? value, FontWeight fallback)
@@ -1242,6 +1330,7 @@ namespace TaskbarInfo
             }
 
             ApplyApplicationTheme();
+            ApplyTrayIcon();
             ApplySettings();
         }
 
@@ -1373,6 +1462,193 @@ namespace TaskbarInfo
 
             _waterReminderTimer.Start();
             UpdateWaterReminder();
+        }
+
+        private void ApplyTaskbarCustomization()
+        {
+            IntPtr taskbar = TaskbarMonitorLocator.FindTaskbarWindow(_settings.TaskbarMonitorDeviceName);
+            if (taskbar == IntPtr.Zero) return;
+
+            bool skipCenteringPass = false;
+
+            if (_settings.ApplyTaskbarAcrylic)
+            {
+                // Re-assert on every pass: Explorer rebuilds its accent policy when windows
+                // are added or removed, which silently drops our override.
+                TaskbarAppearance.ApplyWhiteAcrylic(taskbar);
+                _acrylicApplied = true;
+            }
+            else if (_acrylicApplied)
+            {
+                // Only restore once, on the transition from on to off. Toggling the system
+                // transparency flag repeatedly would flicker the whole shell.
+                _acrylicApplied = false;
+                TaskbarAppearance.ClearAcrylic(taskbar);
+
+                // The transparency toggle makes Explorer rebuild the task list, which snaps
+                // it back to the left edge. Re-centre once the shell settles; polling here
+                // covers the rebuild finishing after ClearAcrylic returns.
+                if (_settings.CenterTaskbarIcons)
+                {
+                    // Stop the slow background poller first: while Explorer is rebuilding it
+                    // would compute bogus bounds and fight the corrector below.
+                    StopTaskbarCenteringTimer();
+                    RecentreAfterShellRebuild();
+                    skipCenteringPass = true;
+                }
+            }
+
+            _lastAcrylicTaskbar = taskbar;
+
+            if (skipCenteringPass && _settings.CenterTaskbarIcons)
+            {
+                // The background corrector owns the layout until the shell settles; running
+                // the normal path here would restart the poller and fight it.
+                return;
+            }
+
+            ManageTaskbarCentering(taskbar);
+        }
+
+        private void ManageTaskbarCentering(IntPtr taskbar)
+        {
+            if (!_settings.CenterTaskbarIcons)
+            {
+                if (_centeringApplied && _centeredTaskSwitcher != IntPtr.Zero)
+                {
+                    TaskbarCentering.RestoreDefaultLayout(taskbar, _centeredTaskSwitcher);
+                }
+
+                _centeringApplied = false;
+                _centeredTaskSwitcher = IntPtr.Zero;
+                StopTaskbarCenteringTimer();
+                return;
+            }
+
+            ApplyTaskbarCentering(taskbar);
+            StartTaskbarCenteringTimer();
+        }
+
+        private void ApplyTaskbarCentering(IntPtr taskbar)
+        {
+            IntPtr switcher = TaskbarCentering.FindTaskSwitcherWindow(taskbar);
+            IntPtr list = TaskbarCentering.FindTaskListWindow(taskbar);
+            if (switcher == IntPtr.Zero) return;
+
+            var bounds = TaskbarCentering.ComputeCenteredBounds(taskbar, switcher, list);
+            if (bounds == null) return;
+
+            if (TaskbarCentering.ApplyCenteredLayout(bounds.Value, switcher))
+            {
+                _centeredTaskSwitcher = switcher;
+                _centeringApplied = true;
+                _lastCenteredBounds = bounds;
+            }
+        }
+
+        /// <summary>
+        /// Explorer rebuilds the task list after the system transparency flag is toggled,
+        /// resetting it to the left edge. The rebuild blocks the UI thread, so a
+        /// DispatcherTimer cannot correct the layout in time. Instead, wait on a background
+        /// thread until the shell has settled, then restore the cached centre position.
+        /// </summary>
+        private void RecentreAfterShellRebuild()
+        {
+            var target = _lastCenteredBounds;
+            _recentringAfterRebuild = false;
+
+            if (target == null) return;
+
+            string? deviceName = _settings.TaskbarMonitorDeviceName;
+            var deadline = DateTime.UtcNow.AddSeconds(4);
+
+            _ = Task.Run(async () =>
+            {
+                // Explorer keeps re-applying the left-aligned full-width layout for roughly
+                // 900ms after the toggle; corrections issued inside that window are simply
+                // overwritten. Wait for it to stop, then take the layout back in one shot.
+                await Task.Delay(900).ConfigureAwait(false);
+
+                while (DateTime.UtcNow < deadline)
+                {
+                    IntPtr taskbar = TaskbarMonitorLocator.FindTaskbarWindow(deviceName);
+                    IntPtr switcher = taskbar == IntPtr.Zero
+                        ? IntPtr.Zero
+                        : TaskbarCentering.FindTaskSwitcherWindow(taskbar);
+
+                    if (switcher != IntPtr.Zero &&
+                        UnmanagedMethods.GetWindowRect(switcher, out UnmanagedMethods.RECT current))
+                    {
+                        // Explorer resets BOTH position and width while rebuilding. Restore
+                        // the full geometry (not just Left) or the next re-layout pass will
+                        // push the list back to the left edge again.
+                        int currentWidth = current.Right - current.Left;
+                        bool wrongLeft = Math.Abs(current.Left - target.Value.Left) > 2;
+                        bool wrongWidth = Math.Abs(currentWidth - target.Value.Width) > 2;
+                        if (wrongLeft || wrongWidth)
+                        {
+                            TaskbarCentering.ApplyCenteredLayout(target.Value, switcher);
+                        }
+                    }
+
+                    await Task.Delay(30).ConfigureAwait(false);
+                }
+
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (!_settings.CenterTaskbarIcons) return;
+                    // Final pass with a fresh measurement now that the shell is stable, so
+                    // the resting position matches the buttons actually on screen.
+                    IntPtr finalTaskbar = TaskbarMonitorLocator.FindTaskbarWindow(deviceName);
+                    if (finalTaskbar != IntPtr.Zero) ApplyTaskbarCentering(finalTaskbar);
+                    StartTaskbarCenteringTimer();
+                }));
+            });
+        }
+
+        private void StartTaskbarCenteringTimer()
+        {
+            if (_taskbarCenteringTimer != null) return;
+
+            // Explorer re-lays-out the task list whenever buttons are added or removed,
+            // which would otherwise snap the icons back to the left edge.
+            _taskbarCenteringTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromMilliseconds(250)
+            };
+            _taskbarCenteringTimer.Tick += (_, _) =>
+            {
+                if (!_settings.CenterTaskbarIcons) return;
+                IntPtr taskbar = TaskbarMonitorLocator.FindTaskbarWindow(_settings.TaskbarMonitorDeviceName);
+                if (taskbar != IntPtr.Zero) ApplyTaskbarCentering(taskbar);
+            };
+            _taskbarCenteringTimer.Start();
+        }
+
+        private void StopTaskbarCenteringTimer()
+        {
+            _taskbarCenteringTimer?.Stop();
+            _taskbarCenteringTimer = null;
+        }
+
+        private void RestoreTaskbarOnExit()
+        {
+            StopTaskbarCenteringTimer();
+
+            IntPtr taskbar = TaskbarMonitorLocator.FindTaskbarWindow(_settings.TaskbarMonitorDeviceName);
+            if (taskbar == IntPtr.Zero) return;
+
+            if (_centeringApplied && _centeredTaskSwitcher != IntPtr.Zero)
+            {
+                TaskbarCentering.RestoreDefaultLayout(taskbar, _centeredTaskSwitcher);
+                _centeringApplied = false;
+            }
+
+            if (_acrylicApplied)
+            {
+                TaskbarAppearance.ClearAcrylic(taskbar);
+                _acrylicApplied = false;
+            }
         }
 
         private void UpdateWaterReminder()
@@ -1670,6 +1946,10 @@ namespace TaskbarInfo
                 VolumeMuteToggleButton.Content = isMuted ? "\ue1ac" : "\ue1ab";
                 VolumeMuteToggleButton.ToolTip = isMuted ? "取消静音" : "静音";
             }
+
+            // The slider now mirrors the real device volume, so later ValueChanged events
+            // genuinely come from the user and are safe to write back.
+            _volumeUiReady = true;
         }
 
         private static string GetVolumeGlyph(float volume, bool isMuted)
@@ -1915,6 +2195,11 @@ namespace TaskbarInfo
         {
             if (_isUpdatingVolumeSliderProgrammatically) return;
             if (double.IsNaN(e.NewValue) || double.IsInfinity(e.NewValue)) return;
+
+            // The slider starts at its XAML default and fires ValueChanged before the real
+            // system volume has been read. Writing back at that point would silently change
+            // the user's volume on every launch, so ignore events until the UI is synced.
+            if (!_volumeUiReady) return;
 
             float level = (float)(Math.Clamp(e.NewValue, 0.0, 100.0) / 100.0);
             _audioDeviceService.SetMasterVolume(level);
@@ -2571,8 +2856,8 @@ namespace TaskbarInfo
              // Demoted: Used to be Main (Top), now Next (Bottom)
              _nextLyricControl = oldMain; 
 
-             double topPos = 2;
-             double bottomPos = _settings.FontSize + 4; // Use updated offset
+             double topPos, bottomPos;
+             GetDoubleLinePositions(out topPos, out bottomPos);
              
              // 2. Animate NEW Main (Moving Bottom -> Top)
              // Reset animations first

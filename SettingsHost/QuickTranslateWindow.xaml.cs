@@ -69,8 +69,16 @@ public sealed partial class QuickTranslateWindow : Window
         }
 
         PositionOnTargetScreen();
-        if (QuickTranslateWindowMaterialParser.Parse(_settings.QuickTranslateWindowMaterial) ==
-            QuickTranslateWindowMaterial.Acrylic)
+        // Keep this in sync with the Windows 10 fallback in ApplyWindowMaterial.
+        QuickTranslateWindowMaterial material = QuickTranslateWindowMaterialParser.Parse(
+            _settings.QuickTranslateWindowMaterial);
+        if (material == QuickTranslateWindowMaterial.Mica &&
+            !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+        {
+            material = QuickTranslateWindowMaterial.Acrylic;
+        }
+
+        if (material == QuickTranslateWindowMaterial.Acrylic)
         {
             DispatcherQueue.TryEnqueue(ApplyNativeAcrylicBackdrop);
         }
@@ -102,6 +110,15 @@ public sealed partial class QuickTranslateWindow : Window
     {
         QuickTranslateWindowMaterial material = QuickTranslateWindowMaterialParser.Parse(
             _settings.QuickTranslateWindowMaterial);
+
+        // MicaBackdrop needs the Windows 11 DWM backdrop pipeline. On Windows 10 it leaves
+        // the window with no background at all, so fall back to acrylic, which is supported.
+        if (material == QuickTranslateWindowMaterial.Mica &&
+            !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+        {
+            material = QuickTranslateWindowMaterial.Acrylic;
+        }
+
         SystemBackdrop = material switch
         {
             QuickTranslateWindowMaterial.Solid => null,

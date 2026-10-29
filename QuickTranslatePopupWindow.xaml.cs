@@ -282,6 +282,16 @@ public partial class QuickTranslatePopupWindow : Window
         ResolvedApplicationTheme theme = ApplicationThemeParser.Resolve(_settings.ApplicationTheme);
         QuickTranslateWindowMaterial material = QuickTranslateWindowMaterialParser.Parse(
             _settings.QuickTranslateWindowMaterial);
+
+        // Mica is a DWM_SYSTEMBACKDROP_TYPE backdrop, which Windows 10 does not implement:
+        // the attribute call fails and the card would stay fully transparent, leaving the
+        // desktop showing through the window. Fall back to acrylic, which Windows 10 has.
+        if (material == QuickTranslateWindowMaterial.Mica &&
+            !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+        {
+            material = QuickTranslateWindowMaterial.Acrylic;
+        }
+
         RootCard.Background = material switch
         {
             QuickTranslateWindowMaterial.Solid => SolidBackground(theme),
